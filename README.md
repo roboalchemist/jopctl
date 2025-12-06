@@ -97,6 +97,34 @@ jopctl resource show RESOURCE_ID
 jopctl resource create --file ./image.png --title "Screenshot"
 jopctl resource update RESOURCE_ID --title "New Title"
 jopctl resource delete RESOURCE_ID
+
+# Export
+jopctl export ~/backup --export-format md
+jopctl export ~/backup --export-format raw --resources
+jopctl export ~/backup --notebook "Projects"
+jopctl export ~/backup.jex --export-format jex
+```
+
+### Export Formats
+
+Export your notes to various formats:
+
+- **md** (default): Markdown files preserving folder structure
+- **raw**: JSON files with full note metadata
+- **jex**: Joplin Exchange format (tar archive)
+
+```bash
+# Export all notes as markdown
+jopctl export ~/joplin-backup
+
+# Export specific notebook with attachments
+jopctl export ~/backup --notebook "Projects" --resources
+
+# Export specific notes by ID
+jopctl export ~/backup --notes "id1,id2,id3"
+
+# Create portable Joplin archive
+jopctl export ~/backup.jex --export-format jex --resources
 ```
 
 ### JSON Output for Scripting
