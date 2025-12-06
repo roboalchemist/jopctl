@@ -178,6 +178,33 @@ class JoplinClient:
     def resource(self, resource_id: str) -> Dict[str, Any]:
         return self._get(f"/resources/{resource_id}")
 
+    def resource_file(self, resource_id: str) -> bytes:
+        """Download resource binary content."""
+        resp = requests.get(
+            f"{self.base_url}/resources/{resource_id}/file",
+            params={"token": self.token},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.content
+
+    def note_full(self, note_id: str) -> Dict[str, Any]:
+        """Get note with all fields including body."""
+        fields = (
+            "id,title,body,created_time,updated_time,parent_id,"
+            "is_todo,todo_completed,todo_due,source_url,author,"
+            "latitude,longitude,altitude,markup_language"
+        )
+        return self._get(f"/notes/{note_id}", {"fields": fields})
+
+    def note_tags(self, note_id: str) -> List[Dict[str, Any]]:
+        """Get tags attached to a note."""
+        return self._collect_paginated(f"/notes/{note_id}/tags")
+
+    def note_resources(self, note_id: str) -> List[Dict[str, Any]]:
+        """Get resources attached to a note."""
+        return self._collect_paginated(f"/notes/{note_id}/resources")
+
     def create_folder(self, title: str, parent_id: Optional[str] = None) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"title": title}
         if parent_id:
@@ -691,6 +718,247 @@ def handle_resource_delete(client: JoplinClient, output_format: str, resource_id
     print_output(result or {"deleted": resource_id}, output_format)
 
 
+def sanitize_filename(name: str) -> str:
+    """Sanitize filename for filesystem compatibility."""
+    # Replace problematic characters
+    for char in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
+        name = name.replace(char, '-')
+    return name.strip() or "untitled"
+
+
+def handle_export(
+    client: JoplinClient,
+    output_format: str,
+    dest_path: str,
+    export_format: str,
+    notebook_filter: Optional[str],
+    note_ids: Optional[str],
+    include_resources: bool,
+) -> None:
+    """Export notes to the specified format."""
+    dest = Path(dest_path)
+
+    # Build folder lookup
+    folders = client.folders()
+    folder_map = {f["id"]: f for f in folders}
+    folder_tree = build_folder_tree(folders)
+
+    def get_folder_path(folder_id: Optional[str]) -> str:
+        """Build folder path from root to this folder."""
+        if not folder_id or folder_id not in folder_map:
+            return ""
+        parts = []
+        current = folder_id
+        while current and current in folder_map:
+            parts.insert(0, sanitize_filename(folder_map[current].get("title", "untitled")))
+            current = folder_map[current].get("parent_id")
+        return "/".join(parts)
+
+    # Determine which notes to export
+    notes_to_export: List[Dict[str, Any]] = []
+
+    if note_ids:
+        # Export specific notes
+        for nid in note_ids.split(","):
+            nid = nid.strip()
+            if nid:
+                notes_to_export.append({"id": nid})
+    elif notebook_filter:
+        # Export specific notebook
+        folder_id = resolve_folder_id(notebook_filter, folders)
+        if not folder_id:
+            cli_error(f"No notebook found for '{notebook_filter}'.")
+        # Get all notes in this folder and subfolders
+        def collect_folder_notes(fid: str) -> None:
+            notes_to_export.extend(client.folder_notes(fid))
+            node = folder_tree.get(fid)
+            if node:
+                for child in node.get("children", []):
+                    collect_folder_notes(child["id"])
+        collect_folder_notes(folder_id)
+    else:
+        # Export all notes
+        notes_to_export = client.notes()
+
+    if not notes_to_export:
+        click.echo("No notes to export.")
+        return
+
+    # Create destination directory
+    dest.mkdir(parents=True, exist_ok=True)
+
+    exported_count = 0
+    resource_count = 0
+
+    if export_format == "md":
+        # Markdown export with folder structure
+        resources_dir = dest / "_resources"
+
+        for note_ref in notes_to_export:
+            note = client.note_full(note_ref["id"])
+            folder_path = get_folder_path(note.get("parent_id"))
+
+            # Create folder structure
+            note_dir = dest / folder_path if folder_path else dest
+            note_dir.mkdir(parents=True, exist_ok=True)
+
+            # Write note as markdown
+            title = sanitize_filename(note.get("title", "untitled"))
+            note_path = note_dir / f"{title}.md"
+
+            # Handle duplicate filenames
+            counter = 1
+            while note_path.exists():
+                note_path = note_dir / f"{title}_{counter}.md"
+                counter += 1
+
+            body = note.get("body", "")
+            note_path.write_text(body, encoding="utf-8")
+            exported_count += 1
+
+            # Export resources if requested
+            if include_resources:
+                note_resources = client.note_resources(note["id"])
+                for res in note_resources:
+                    try:
+                        res_meta = client.resource(res["id"])
+                        res_data = client.resource_file(res["id"])
+
+                        resources_dir.mkdir(parents=True, exist_ok=True)
+                        res_filename = res_meta.get("title") or res_meta.get("id")
+                        res_path = resources_dir / sanitize_filename(res_filename)
+                        res_path.write_bytes(res_data)
+                        resource_count += 1
+                    except Exception as e:
+                        click.echo(f"Warning: Failed to export resource {res['id']}: {e}", err=True)
+
+            if exported_count % 10 == 0:
+                click.echo(f"Exported {exported_count} notes...", err=True)
+
+    elif export_format == "raw":
+        # Raw JSON export
+        resources_dir = dest / "_resources"
+        all_notes = []
+
+        for note_ref in notes_to_export:
+            note = client.note_full(note_ref["id"])
+
+            # Get tags for this note
+            try:
+                note["tags"] = client.note_tags(note["id"])
+            except Exception:
+                note["tags"] = []
+
+            # Get resources metadata
+            if include_resources:
+                try:
+                    note["resources"] = client.note_resources(note["id"])
+                    # Download resource files
+                    for res in note["resources"]:
+                        try:
+                            res_data = client.resource_file(res["id"])
+                            resources_dir.mkdir(parents=True, exist_ok=True)
+                            res_path = resources_dir / res["id"]
+                            res_path.write_bytes(res_data)
+                            resource_count += 1
+                        except Exception as e:
+                            click.echo(f"Warning: Failed to export resource {res['id']}: {e}", err=True)
+                except Exception:
+                    note["resources"] = []
+
+            all_notes.append(note)
+            exported_count += 1
+
+            if exported_count % 10 == 0:
+                click.echo(f"Exported {exported_count} notes...", err=True)
+
+        # Write notes JSON
+        notes_file = dest / "notes.json"
+        notes_file.write_text(json.dumps(all_notes, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        # Write folders JSON
+        folders_file = dest / "folders.json"
+        folders_file.write_text(json.dumps(folders, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        # Write tags JSON
+        tags = client.tags()
+        tags_file = dest / "tags.json"
+        tags_file.write_text(json.dumps(tags, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    elif export_format == "jex":
+        # JEX format is a tar archive - simplified implementation
+        import tarfile
+        import io
+
+        jex_path = dest / "export.jex"
+
+        with tarfile.open(jex_path, "w") as tar:
+            # Add notes
+            for note_ref in notes_to_export:
+                note = client.note_full(note_ref["id"])
+                note_json = json.dumps(note, ensure_ascii=False)
+
+                # Create tar entry
+                data = note_json.encode("utf-8")
+                info = tarfile.TarInfo(name=f"{note['id']}.json")
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+                exported_count += 1
+
+                # Add resources
+                if include_resources:
+                    try:
+                        note_resources = client.note_resources(note["id"])
+                        for res in note_resources:
+                            try:
+                                res_meta = client.resource(res["id"])
+                                res_data = client.resource_file(res["id"])
+
+                                # Add resource metadata
+                                res_json = json.dumps(res_meta, ensure_ascii=False).encode("utf-8")
+                                res_info = tarfile.TarInfo(name=f"resources/{res['id']}.json")
+                                res_info.size = len(res_json)
+                                tar.addfile(res_info, io.BytesIO(res_json))
+
+                                # Add resource file
+                                file_info = tarfile.TarInfo(name=f"resources/{res['id']}")
+                                file_info.size = len(res_data)
+                                tar.addfile(file_info, io.BytesIO(res_data))
+                                resource_count += 1
+                            except Exception as e:
+                                click.echo(f"Warning: Failed to export resource {res['id']}: {e}", err=True)
+                    except Exception:
+                        pass
+
+                if exported_count % 10 == 0:
+                    click.echo(f"Exported {exported_count} notes...", err=True)
+
+            # Add folders
+            folders_json = json.dumps(folders, ensure_ascii=False).encode("utf-8")
+            folders_info = tarfile.TarInfo(name="folders.json")
+            folders_info.size = len(folders_json)
+            tar.addfile(folders_info, io.BytesIO(folders_json))
+
+            # Add tags
+            tags = client.tags()
+            tags_json = json.dumps(tags, ensure_ascii=False).encode("utf-8")
+            tags_info = tarfile.TarInfo(name="tags.json")
+            tags_info.size = len(tags_json)
+            tar.addfile(tags_info, io.BytesIO(tags_json))
+
+        click.echo(f"Created {jex_path}")
+
+    else:
+        cli_error(f"Unknown export format: {export_format}")
+
+    # Summary
+    summary = {"exported_notes": exported_count, "exported_resources": resource_count, "destination": str(dest)}
+    if output_format == "text":
+        click.echo(f"Exported {exported_count} notes and {resource_count} resources to {dest}")
+    else:
+        print_output(summary, output_format)
+
+
 @click.group()
 @click.option("--port", default=DEFAULT_PORT, show_default=True, help="Joplin API port.")
 @click.option(
@@ -881,6 +1149,43 @@ def search(
     client: JoplinClient, output_format: str, query: str, item_type: Optional[str], limit: Optional[int]
 ) -> None:  # pragma: no cover - CLI wiring
     handle_search(client, output_format, query, item_type, limit)
+
+
+@cli.command("export")
+@click.argument("dest_path", type=click.Path())
+@click.option(
+    "--export-format",
+    type=click.Choice(["md", "raw", "jex"]),
+    default="md",
+    show_default=True,
+    help="Export format: md (markdown files), raw (JSON), jex (Joplin archive).",
+)
+@click.option("--notebook", "notebook_filter", help="Export only notes from this notebook (ID or title).")
+@click.option("--notes", "note_ids", help="Export specific notes (comma-separated IDs).")
+@click.option("--resources", "include_resources", is_flag=True, help="Include attachments/resources.")
+@format_option
+@with_client
+def export_cmd(
+    client: JoplinClient,
+    output_format: str,
+    dest_path: str,
+    export_format: str,
+    notebook_filter: Optional[str],
+    note_ids: Optional[str],
+    include_resources: bool,
+) -> None:  # pragma: no cover - CLI wiring
+    """Export notes to various formats.
+
+    DEST_PATH is the destination directory for exported notes.
+
+    \b
+    Examples:
+      jopctl export ~/backup --export-format md
+      jopctl export ~/backup --export-format raw --resources
+      jopctl export ~/backup --notebook "Projects" --export-format md
+      jopctl export ~/backup --notes "id1,id2,id3" --export-format jex
+    """
+    handle_export(client, output_format, dest_path, export_format, notebook_filter, note_ids, include_resources)
 
 
 @cli.group()
